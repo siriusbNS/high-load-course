@@ -8,12 +8,14 @@ import okhttp3.RequestBody
 import okhttp3.Response
 import org.slf4j.LoggerFactory
 import org.springframework.http.ResponseEntity
+import ru.quipy.common.utils.FixedWindowRateLimiter
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -38,6 +40,8 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), requestAverageProcessingTime)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        rateLimiter.tickBlocking()
+
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
         val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
@@ -47,12 +51,13 @@ class PaymentExternalSystemAdapterImpl(
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 //        if (rateLimiter.tick()) {
-            val request = Request.Builder().run {
+
+        val request = Request.Builder().run {
                 url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
             }.build()
+
         try {
-            rateLimiter.tickBlocking()
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -87,9 +92,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         }
-//    }else {
-//            logger.warn("[$accountName] Rate limit exceeded, skipping request for payment: $paymentId")
-//        }
+
     }
 
     override fun price() = properties.price
