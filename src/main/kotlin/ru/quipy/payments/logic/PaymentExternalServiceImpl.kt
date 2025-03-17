@@ -38,7 +38,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), requestAverageProcessingTime)
     private val window = OngoingWindow(parallelRequests)
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        rateLimiter.tickBlocking()
+
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -50,7 +50,8 @@ class PaymentExternalSystemAdapterImpl(
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        for (i in 0 until 3) {
+        for (i in 0 until 5) {
+            rateLimiter.tickBlocking()
             val request = Request.Builder().run {
                 url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
@@ -98,6 +99,7 @@ class PaymentExternalSystemAdapterImpl(
                 window.release()
             }
 //            Thread.sleep(100)
+            logger.info("Thread sleep $i")
         }
     }
 
