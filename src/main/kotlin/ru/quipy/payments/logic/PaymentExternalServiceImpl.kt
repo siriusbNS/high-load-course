@@ -39,8 +39,8 @@ class PaymentExternalSystemAdapterImpl(
     private val client = OkHttpClient.Builder().build()
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), requestAverageProcessingTime)
     private val window = OngoingWindow(parallelRequests)
-    private val histogram = Histogram(1, requestAverageProcessingTime.toMillis()*2 , 2)
-    private var currentTimeout85thPercentile = requestAverageProcessingTime.toMillis()*2
+    private val histogram = Histogram(1, requestAverageProcessingTime.toMillis()*5 , 2)
+    private var currentTimeout85thPercentile = requestAverageProcessingTime.toMillis()*5
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         rateLimiter.tickBlocking()
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
