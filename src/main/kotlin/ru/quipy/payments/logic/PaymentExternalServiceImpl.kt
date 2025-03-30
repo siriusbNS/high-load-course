@@ -13,6 +13,8 @@ import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
+import java.time.Instant
+import java.time.LocalDateTime
 import java.util.*
 import java.util.concurrent.TimeUnit
 
@@ -37,12 +39,12 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val client = OkHttpClient.Builder().build()
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), requestAverageProcessingTime)
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val window = OngoingWindow(parallelRequests)
     private val histogram = Histogram(1, requestAverageProcessingTime.toMillis()*5 , 2)
     private var currentTimeout85thPercentile = requestAverageProcessingTime.toMillis()*5
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        rateLimiter.tickBlocking()
+
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -52,7 +54,10 @@ class PaymentExternalSystemAdapterImpl(
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        for (i in 0 until 3) {
+        for (i in 0 until 5) {
+            val deadlineTime = LocalDateTime.ofInstant(Instant.ofEpochMilli(deadline), TimeZone.getDefault().toZoneId())
+            if (deadlineTime.isBefore(LocalDateTime.now())) break
+            rateLimiter.tickBlocking()
             val request = Request.Builder().run {
                 url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
@@ -111,6 +116,7 @@ class PaymentExternalSystemAdapterImpl(
             } finally {
                 window.release()
             }
+//            Thread.sleep(100)
         }
     }
 
