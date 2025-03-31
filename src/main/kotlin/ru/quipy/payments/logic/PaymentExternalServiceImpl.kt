@@ -16,6 +16,7 @@ import java.time.Duration
 import java.time.Instant
 import java.time.LocalDateTime
 import java.util.*
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 
@@ -43,6 +44,8 @@ class PaymentExternalSystemAdapterImpl(
     private val window = OngoingWindow(parallelRequests)
     private val histogram = Histogram(1, requestAverageProcessingTime.toMillis()*5 , 2)
     private var currentTimeout85thPercentile = requestAverageProcessingTime.toMillis()*5
+    private val threadPool = Executors.newFixedThreadPool(parallelRequests)
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
 
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -54,69 +57,78 @@ class PaymentExternalSystemAdapterImpl(
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        for (i in 0 until 5) {
-            val deadlineTime = LocalDateTime.ofInstant(Instant.ofEpochMilli(deadline), TimeZone.getDefault().toZoneId())
-            if (deadlineTime.isBefore(LocalDateTime.now())) break
-            rateLimiter.tickBlocking()
-            val request = Request.Builder().run {
-                url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                post(emptyBody)
-            }.build()
+        threadPool.submit() {
+            for (i in 0 until 5) {
+                val deadlineTime =
+                    LocalDateTime.ofInstant(Instant.ofEpochMilli(deadline), TimeZone.getDefault().toZoneId())
+                if (deadlineTime.isBefore(LocalDateTime.now())) break
+                rateLimiter.tickBlocking()
+                val request = Request.Builder().run {
+                    url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                    post(emptyBody)
+                }.build()
 
-            window.acquire()
-            try {
-                val startTime = System.currentTimeMillis()
-                var success = false
+                window.acquire()
+                try {
+                    val startTime = System.currentTimeMillis()
+                    var success = false
 
-                val clientWithTimeout = client.newBuilder()
-                    .callTimeout(currentTimeout85thPercentile, TimeUnit.MILLISECONDS)
-                    .build()
+                    val clientWithTimeout = client.newBuilder()
+                        .callTimeout(currentTimeout85thPercentile, TimeUnit.MILLISECONDS)
+                        .build()
 
-                clientWithTimeout.newCall(request).execute().use { response ->
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
+                    clientWithTimeout.newCall(request).execute().use { response ->
+                        val body = try {
+                            mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        } catch (e: Exception) {
+                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                        }
 
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-                    success = body.result
+                        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                        success = body.result
 
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                    }
-                }
-
-                if (success) break
-
-                val duration = System.currentTimeMillis() - startTime
-                histogram.recordValue(duration)
-
-                currentTimeout85thPercentile = histogram.getValueAtPercentile(90.0)
-                logger.info("[$accountName] Updated 85th percentile timeout: $currentTimeout85thPercentile ms")
-
-            } catch (e: Exception) {
-                when (e) {
-                    is SocketTimeoutException -> {
-                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
                         paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                            it.logProcessing(body.result, now(), transactionId, reason = body.message)
                         }
                     }
 
-                    else -> {
-                        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+                    if (success) break
 
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = e.message)
+                    val duration = System.currentTimeMillis() - startTime
+                    histogram.recordValue(duration)
+
+                    currentTimeout85thPercentile = histogram.getValueAtPercentile(90.0)
+                    logger.info("[$accountName] Updated 85th percentile timeout: $currentTimeout85thPercentile ms")
+
+                } catch (e: Exception) {
+                    when (e) {
+                        is SocketTimeoutException -> {
+                            logger.error(
+                                "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId",
+                                e
+                            )
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                            }
+                        }
+
+                        else -> {
+                            logger.error(
+                                "[$accountName] Payment failed for txId: $transactionId, payment: $paymentId",
+                                e
+                            )
+
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = e.message)
+                            }
                         }
                     }
+                } finally {
+                    window.release()
                 }
-            } finally {
-                window.release()
-            }
 //            Thread.sleep(100)
+            }
         }
     }
 
